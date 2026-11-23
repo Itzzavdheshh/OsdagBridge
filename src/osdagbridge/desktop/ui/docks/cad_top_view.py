@@ -5,8 +5,8 @@ Author: Arushi
 """
 from osdagbridge.core.utils.common import *
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize
+from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal, QEvent
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon
 from .cad_cross_section import CrossSectionCADWidget
 
@@ -27,6 +27,7 @@ LEADER_TEXT_OFFSET = 25    # leader label distance
 
 class TopViewCADWidget(QWidget):
     """Widget for drawing bridge top view"""
+    parameter_edit_requested = Signal(str, object)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,6 +42,14 @@ class TopViewCADWidget(QWidget):
         
         # Zoom level for this widget
         self.zoom_level = 1.0
+
+        # Double-click dimension editing state
+        self.enable_parameter_editing = True
+        self._dimension_labels = []
+        self._editor = None
+        self._active_edit_param = None
+        self._committed = False
+        self._cancelled = False
         
         # Setup zoom controls inside this widget
         self.setup_zoom_controls()
@@ -478,15 +487,156 @@ class TopViewCADWidget(QWidget):
             self.update()
 
     def paintEvent(self, event):
-        # clear hover zones at start of each paint
+        # clear hover zones and dimension labels at start of each paint
         self.top_view_hover_zones = []
+        self._dimension_labels.clear()
         
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(255, 255, 255))
         
         self.draw_top_view(painter)
-        
+
+    def _register_dimension_label(self, rect, key, name, is_editable, value, unit):
+        """Register screen-space bounding rect of a dimension label for hit-testing."""
+        if rect is not None and isinstance(rect, QRectF) and rect.isValid():
+            self._dimension_labels.append({
+                'rect': QRectF(rect),
+                'key': key,
+                'name': name,
+                'is_editable': is_editable,
+                'value': float(value) if value is not None else 0.0,
+                'unit': unit,
+            })
+
+    def mouseDoubleClickEvent(self, event):
+        """Handle double click on editable dimension labels."""
+        if not self.enable_parameter_editing or not self.show_dimensions:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        clicked_point = QPointF(pos.x(), pos.y())
+
+        hit_label = None
+        for label in self._dimension_labels:
+            hit_rect = label['rect'].adjusted(-4, -4, 4, 4)
+            if hit_rect.contains(clicked_point):
+                hit_label = label
+                break
+
+        if not hit_label:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        if not hit_label['is_editable']:
+            # Locked parameters (Bracing Spacing, etc.) remain read-only
+            event.accept()
+            return
+
+        self._open_inline_editor(hit_label)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        """Commit and close editor if clicked outside the editor overlay."""
+        if self._editor is not None:
+            pos = event.position() if hasattr(event, 'position') else event.pos()
+            if not self._editor.geometry().contains(int(pos.x()), int(pos.y())):
+                self._commit_edit()
+        super().mousePressEvent(event)
+
+    def _open_inline_editor(self, label_info: dict):
+        """Open temporary QLineEdit overlay directly on the clicked dimension label."""
+        if self._editor is not None:
+            self._close_editor()
+
+        self._active_edit_param = label_info
+        self._committed = False
+        self._cancelled = False
+
+        self._editor = QLineEdit(self)
+        val = label_info['value']
+        if label_info['unit'] == 'mm':
+            val_str = f"{val:.0f}"
+        else:
+            val_str = f"{val:g}"
+        self._editor.setText(val_str)
+
+        geo = self._calculate_editor_geometry(label_info['rect'])
+        self._editor.setGeometry(geo)
+        self._editor.setStyleSheet("""
+            QLineEdit {
+                background-color: #ffffff;
+                color: #000000;
+                border: 2px solid #90AF13;
+                border-radius: 3px;
+                padding: 1px 4px;
+                font-family: Arial;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        self._editor.installEventFilter(self)
+        self._editor.show()
+        self._editor.selectAll()
+        self._editor.setFocus()
+
+    def _calculate_editor_geometry(self, label_rect: QRectF):
+        """Compute pixel bounds for the editor overlay centered over the label."""
+        padding_x = 6
+        padding_y = 3
+        min_width = 80
+        min_height = 24
+
+        w = max(int(label_rect.width() + 2 * padding_x), min_width)
+        h = max(int(label_rect.height() + 2 * padding_y), min_height)
+
+        cx = int(label_rect.center().x())
+        cy = int(label_rect.center().y())
+
+        x = max(0, cx - w // 2)
+        y = max(0, cy - h // 2)
+        return QRectF(x, y, w, h).toRect()
+
+    def _commit_edit(self):
+        """Validate and commit user input, preventing duplicate commits."""
+        if self._committed or self._cancelled or self._editor is None:
+            return
+        self._committed = True
+        new_text = self._editor.text().strip()
+        param_key = self._active_edit_param['key'] if self._active_edit_param else None
+        self._close_editor()
+        if param_key:
+            self.parameter_edit_requested.emit(param_key, new_text)
+
+    def _close_editor(self):
+        """Tear down temporary inline editor."""
+        if self._editor is not None:
+            self._editor.removeEventFilter(self)
+            self._editor.deleteLater()
+            self._editor = None
+        self._active_edit_param = None
+        self.update()
+
+    def eventFilter(self, obj, event):
+        """Capture Enter (commit), Escape (cancel), and FocusOut (commit once)."""
+        if obj == self._editor and self._editor is not None:
+            if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Escape:
+                    self._cancelled = True
+                    self._close_editor()
+                    return True
+                elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    self._commit_edit()
+                    return True
+            elif event.type() == QEvent.FocusOut:
+                if not self._cancelled and not self._committed:
+                    self._commit_edit()
+                else:
+                    self._close_editor()
+                return False
+        return super().eventFilter(obj, event)
+
     def draw_text_with_background(self, painter, x, y, text,
                               bg_color=QColor(255, 255, 255, 230), 
                               text_color=QColor(0, 0, 0), font_size=9, bold=False):
@@ -525,6 +675,8 @@ class TopViewCADWidget(QWidget):
 
         for i, line in enumerate(lines):
             painter.drawText(int(x), int(first_line_y + i * line_height), line)
+
+        return bg_rect
 
     
     def draw_dimension_arrow(self, painter, x1, y1, x2, y2, text, horizontal=True, offset=0, text_offset=0, draw_extensions=True, extension_direction='down', extension_end_y=None):
@@ -1280,10 +1432,11 @@ class TopViewCADWidget(QWidget):
             x1_brace = bracing_positions[0] + x_offset_last
             x2_brace = bracing_positions[1] + x_offset_last
             
-            self.draw_dimension_arrow_with_extensions_up(
+            bs_rect = self.draw_dimension_arrow_with_extensions_up(
                 painter, x1_brace, dim_y1, x2_brace, dim_y1,
                 label_cb, last_girder_y
             )
+            self._register_dimension_label(bs_rect, KEY_MP_CB_SPACING, "Bracing Spacing", False, cb_spacing_m, "m")
             dim_y_next = dim_y_base + DIM_STACK_GAP
         else:
             dim_y_next = dim_y_base
@@ -1297,10 +1450,11 @@ class TopViewCADWidget(QWidget):
         if self.show_span_values:
             label_span += f" = {span_m:.1f} m"
         
-        self.draw_dimension_arrow_with_extensions_up(
+        span_rect = self.draw_dimension_arrow_with_extensions_up(
             painter, x1_span, dim_y2, x2_span, dim_y2,
             label_span, last_girder_y
         )
+        self._register_dimension_label(span_rect, KEY_SPAN, "Span Length", True, span_m, "m")
 
         # GIRDER SPACING dimension (always visible)
         if n > 1:
@@ -1330,12 +1484,13 @@ class TopViewCADWidget(QWidget):
             if self.show_carriageway_values:
                 label_text += f"\n= {gs_m:.2f} m"
 
-            self.draw_text_with_background(
+            gs_rect = self.draw_text_with_background(
                 painter, label_x, label_y,
                 label_text,
                 QColor(255, 255, 255, 240),
                 QColor(0, 0, 0), 9, False
             )
+            self._register_dimension_label(gs_rect, KEY_TS_GIRDER_SPACING, "Girder Spacing", True, gs_m, "m")
 
         # CL OF BEARING labels - ALWAYS VISIBLE (moved outside hover condition)
         label_y_bearing = top_extent - 8
@@ -1461,7 +1616,7 @@ class TopViewCADWidget(QWidget):
         metrics = painter.fontMetrics()
         text_width = metrics.boundingRect(text).width()
         
-        self.draw_text_with_background(painter, text_x - text_width/2, text_y, text, 
+        return self.draw_text_with_background(painter, text_x - text_width/2, text_y, text,
                                     QColor(255, 255, 255, 240), QColor(0, 0, 0), 9, False)
 
 

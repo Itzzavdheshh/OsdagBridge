@@ -14,7 +14,10 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 
-import openseespy.opensees as ops
+try:
+    import openseespy.opensees as ops
+except (ImportError, ModuleNotFoundError):
+    ops = None
 
 from .results_data_post_processing import post_process, FORCE_KEEP, DISP_KEEP
 
@@ -83,6 +86,8 @@ _TOOLS_DIR = Path(__file__).resolve().parents[5] / "tools"
 
 def _build_nodes_members() -> tuple[dict, dict]:
     """Read node coords and element connectivity from the live openseespy model."""
+    if ops is None:
+        return {}, {}
     nodes = {
         int(n): list(map(float, ops.nodeCoord(n)))
         for n in ops.getNodeTags()
@@ -979,6 +984,334 @@ def build_forces_summary(result_handler, load_effects_cache: dict) -> dict:
         }
 
     return {"load_cases": lc_summary, "reactions": rxn_summary}
+
+
+# =============================================================================
+# TRANSVERSE MEMBER EXTRACTION (TASK III)
+# =============================================================================
+
+def extract_transverse_member_results(
+    model_or_ds=None,
+    dataset=None,
+    loadcase: str | None = None,
+    nodes: dict | None = None,
+    members: dict | None = None,
+    component: str | None = None,
+    edge_dist: float = 0.0,
+) -> dict:
+    """
+    Extract force and displacement responses for Transverse Members
+    (combining End Diaphragms and Intermediate Cross Bracings into one logical category).
+
+    Distinguishes transverse elements/nodes from longitudinal elements/nodes.
+    Extracts all 9 response components for the selected load case:
+      Forces:        Fx, Vy, Vz, Tx, My, Mz
+      Displacements: Dx, Dy, Dz
+
+    Parameters
+    ----------
+    model_or_ds : OspGrillage | xarray.Dataset | dict | None
+        OspGrillage model, results Dataset, or full data dictionary.
+    dataset : xarray.Dataset | None, optional
+        Explicit results Dataset. If omitted, extracted from model_or_ds.
+    loadcase : str | None, optional
+        Target load case name. Defaults to the first available load case.
+    nodes : dict | None, optional
+        Mapping of node_tag -> [x, y, z].
+    members : dict | None, optional
+        Mapping of element_tag -> [node_i, node_j].
+    component : str | None, optional
+        Specific component to highlight in the summary if desired.
+    edge_dist : float, optional
+        Deck overhang distance in metres.
+
+    Returns
+    -------
+    dict
+        Structured dictionary with:
+        - "loadcase": active load case string
+        - "elements": list of transverse element tags
+        - "nodes": list of transverse node tags
+        - "end_diaphragm_elements": tags belonging to end diaphragms
+        - "cross_bracing_elements": tags belonging to intermediate cross bracings
+        - "element_connectivity": {elem_id: [n1, n2]}
+        - "forces": {elem_id: {comp: (val_i, val_j)}}
+        - "displacements": {node_id: {comp: val}}
+        - "components": {comp_name: {elem_or_node: values}}
+        - "summary": {comp_name: {"max": ..., "min": ...}}
+    """
+    # 1. Resolve Dataset / Data Dict
+    ds = dataset
+    if ds is None:
+        if model_or_ds is not None:
+            if hasattr(model_or_ds, "get_results"):
+                try:
+                    ds = model_or_ds.get_results()
+                except Exception:
+                    ds = None
+            elif hasattr(model_or_ds, "ds") and model_or_ds.ds is not None:
+                ds = model_or_ds.ds
+            elif hasattr(model_or_ds, "data_vars"):
+                ds = model_or_ds
+            elif isinstance(model_or_ds, dict) and ("forces" in model_or_ds or "nodes" in model_or_ds):
+                ds = model_or_ds
+
+    # 2. Resolve Nodes & Members
+    n_dict = nodes
+    m_dict = members
+    if n_dict is None or m_dict is None:
+        if isinstance(model_or_ds, dict) and "nodes" in model_or_ds and "members" in model_or_ds:
+            n_dict = model_or_ds["nodes"]
+            m_dict = model_or_ds["members"]
+        elif isinstance(ds, dict) and "nodes" in ds and "members" in ds:
+            n_dict = ds["nodes"]
+            m_dict = ds["members"]
+        else:
+            try:
+                n_dict, m_dict = _build_nodes_members()
+            except Exception:
+                n_dict, m_dict = {}, {}
+
+    nodes_parsed = {int(k): list(map(float, v)) for k, v in (n_dict or {}).items()}
+    members_parsed = {int(k): list(map(int, v)) for k, v in (m_dict or {}).items()}
+
+    # 3. Classify Transverse vs Longitudinal Elements
+    # Longitudinal elements run parallel to X at constant Z: |z1 - z2| < tol
+    # Transverse elements run across Z: |z1 - z2| >= tol
+    _z_tol = 1e-3
+    geom_transverse: list[int] = []
+    geom_longitudinal: list[int] = []
+    for tag, (n1, n2) in members_parsed.items():
+        if n1 in nodes_parsed and n2 in nodes_parsed:
+            c1 = nodes_parsed[n1]
+            c2 = nodes_parsed[n2]
+            if abs(c1[2] - c2[2]) >= _z_tol:
+                geom_transverse.append(tag)
+            else:
+                geom_longitudinal.append(tag)
+
+    # Check for group metadata from OspGrillage model or data dict
+    group_start_edge = []
+    group_end_edge = []
+    group_transverse_slab = []
+    if model_or_ds is not None and hasattr(model_or_ds, "get_element"):
+        for grp, target in [("start_edge", group_start_edge),
+                            ("end_edge", group_end_edge),
+                            ("transverse_slab", group_transverse_slab)]:
+            try:
+                elems = model_or_ds.get_element(member=grp, options="elements")
+                target.extend([int(e) for e in elems])
+            except Exception:
+                pass
+    elif isinstance(model_or_ds, dict) and "groups" in model_or_ds:
+        grps = model_or_ds.get("groups", {})
+        group_start_edge = [int(e) for e in grps.get("start_edge", [])]
+        group_end_edge = [int(e) for e in grps.get("end_edge", [])]
+        group_transverse_slab = [int(e) for e in grps.get("transverse_slab", [])]
+    elif isinstance(ds, dict) and "groups" in ds:
+        grps = ds.get("groups", {})
+        group_start_edge = [int(e) for e in grps.get("start_edge", [])]
+        group_end_edge = [int(e) for e in grps.get("end_edge", [])]
+        group_transverse_slab = [int(e) for e in grps.get("transverse_slab", [])]
+
+    # Partition into End Diaphragms and Intermediate Cross Bracings
+    end_diaphragms = sorted(list(set(group_start_edge + group_end_edge)))
+    cross_bracings = sorted(list(set(group_transverse_slab)))
+
+    # Fallback to geometric classification if groups were not explicitly present
+    if not end_diaphragms and not cross_bracings and geom_transverse:
+        x_mids = [0.5 * (nodes_parsed[members_parsed[e][0]][0] + nodes_parsed[members_parsed[e][1]][0])
+                  for e in geom_transverse]
+        x_min, x_max = min(x_mids), max(x_mids)
+        x_span = x_max - x_min
+        x_tol = 0.05 * x_span if x_span > 0 else 0.5
+        for e in geom_transverse:
+            xm = 0.5 * (nodes_parsed[members_parsed[e][0]][0] + nodes_parsed[members_parsed[e][1]][0])
+            if abs(xm - x_min) <= x_tol or abs(xm - x_max) <= x_tol:
+                end_diaphragms.append(e)
+            else:
+                cross_bracings.append(e)
+
+    # The single combined category contains both End Diaphragms and Cross Bracings,
+    # strictly excluding all longitudinal members.
+    transverse_elements = sorted(list(set(geom_transverse)))
+    transverse_nodes = sorted(list(set(
+        n for e in transverse_elements for n in members_parsed[e] if e in members_parsed
+    )))
+
+    # 4. Resolve Target Load Case
+    available_lcs: list[str] = []
+    if ds is not None:
+        if hasattr(ds, "coords") and "Loadcase" in ds.coords:
+            raw_lcs = ds.coords["Loadcase"].values
+            if getattr(raw_lcs, "ndim", 0) == 0:
+                item_val = raw_lcs.item() if hasattr(raw_lcs, "item") else raw_lcs
+                available_lcs = [str(item_val)]
+            else:
+                available_lcs = [str(lc) for lc in raw_lcs]
+        elif isinstance(ds, dict) and "forces" in ds:
+            available_lcs = [str(lc) for lc in ds["forces"].keys()]
+
+    target_lc = loadcase
+    if target_lc is None:
+        target_lc = available_lcs[0] if available_lcs else "default"
+    else:
+        target_lc = str(target_lc)
+
+    # 5. Extract 9 Response Components
+    # Component mappings:
+    # Forces: Fx, Vy, Vz, Tx, My, Mz
+    # Displacements: Dx, Dy, Dz
+    force_pairs = {
+        "Fx": ("Vx_i", "Vx_j"),
+        "Vy": ("Vy_i", "Vy_j"),
+        "Vz": ("Vz_i", "Vz_j"),
+        "Tx": ("Mx_i", "Mx_j"),
+        "My": ("My_i", "My_j"),
+        "Mz": ("Mz_i", "Mz_j"),
+    }
+    disp_aliases = {
+        "Dx": ["x", "dx", "Dx"],
+        "Dy": ["y", "dy", "Dy"],
+        "Dz": ["z", "dz", "Dz"],
+    }
+
+    def _get_raw_force(e_tag: int, c_name: str) -> float:
+        if ds is None:
+            return 0.0
+        # xarray Dataset
+        if hasattr(ds, "data_vars") and "forces" in ds.data_vars:
+            try:
+                da = ds["forces"]
+                sel_kwargs = {"Element": e_tag, "Component": c_name}
+                if "Loadcase" in da.dims:
+                    sel_kwargs["Loadcase"] = target_lc
+                return float(da.sel(**sel_kwargs).values)
+            except Exception:
+                for c in ds["forces"].coords["Component"].values:
+                    if str(c).lower() == c_name.lower():
+                        try:
+                            da = ds["forces"]
+                            sel_kwargs = {"Element": e_tag, "Component": c}
+                            if "Loadcase" in da.dims:
+                                sel_kwargs["Loadcase"] = target_lc
+                            return float(da.sel(**sel_kwargs).values)
+                        except Exception:
+                            pass
+                return 0.0
+        # dict structure
+        elif isinstance(ds, dict) and "forces" in ds:
+            f_table = ds["forces"]
+            lc_table = f_table.get(target_lc) or f_table.get(str(target_lc), {})
+            ele_table = lc_table.get(str(e_tag)) or lc_table.get(int(e_tag), {})
+            if c_name in ele_table:
+                return float(ele_table[c_name])
+            for k, v in ele_table.items():
+                if str(k).lower() == c_name.lower():
+                    return float(v)
+            return 0.0
+        return 0.0
+
+    def _get_raw_disp(n_tag: int, aliases: list[str]) -> float:
+        if ds is None:
+            return 0.0
+        # xarray Dataset
+        if hasattr(ds, "data_vars") and "displacements" in ds.data_vars:
+            for alias in aliases:
+                try:
+                    da = ds["displacements"]
+                    sel_kwargs = {"Node": n_tag, "Component": alias}
+                    if "Loadcase" in da.dims:
+                        sel_kwargs["Loadcase"] = target_lc
+                    return float(da.sel(**sel_kwargs).values)
+                except Exception:
+                    pass
+            for c in ds["displacements"].coords["Component"].values:
+                for alias in aliases:
+                    if str(c).lower() == alias.lower():
+                        try:
+                            da = ds["displacements"]
+                            sel_kwargs = {"Node": n_tag, "Component": c}
+                            if "Loadcase" in da.dims:
+                                sel_kwargs["Loadcase"] = target_lc
+                            return float(da.sel(**sel_kwargs).values)
+                        except Exception:
+                            pass
+            return 0.0
+        # dict structure
+        elif isinstance(ds, dict) and "displacements" in ds:
+            d_table = ds["displacements"]
+            lc_table = d_table.get(target_lc) or d_table.get(str(target_lc), {})
+            node_table = lc_table.get(str(n_tag)) or lc_table.get(int(n_tag), {})
+            for alias in aliases:
+                if alias in node_table:
+                    return float(node_table[alias])
+                for k, v in node_table.items():
+                    if str(k).lower() == alias.lower():
+                        return float(v)
+            return 0.0
+        return 0.0
+
+    # Build forces table
+    forces_extracted: dict[int, dict] = {}
+    components_extracted: dict[str, dict] = {k: {} for k in list(force_pairs.keys()) + list(disp_aliases.keys())}
+
+    for e in transverse_elements:
+        ele_entry = {}
+        for f_key, (ci, cj) in force_pairs.items():
+            vi = _get_raw_force(e, ci)
+            vj = _get_raw_force(e, cj)
+            ele_entry[f_key] = (vi, vj)
+            ele_entry[f"{f_key}_i"] = vi
+            ele_entry[f"{f_key}_j"] = vj
+            ele_entry[ci] = vi
+            ele_entry[cj] = vj
+            components_extracted[f_key][e] = (vi, vj)
+        forces_extracted[e] = ele_entry
+
+    # Build displacements table
+    displacements_extracted: dict[int, dict] = {}
+    for n in transverse_nodes:
+        node_entry = {}
+        for d_key, aliases in disp_aliases.items():
+            val = _get_raw_disp(n, aliases)
+            node_entry[d_key] = val
+            node_entry[aliases[0]] = val
+            components_extracted[d_key][n] = val
+        displacements_extracted[n] = node_entry
+
+    # Compute summaries for all 9 components
+    summary: dict[str, dict] = {}
+    for f_key in force_pairs:
+        vals = []
+        for e in transverse_elements:
+            vi, vj = components_extracted[f_key].get(e, (0.0, 0.0))
+            vals.extend([vi, vj])
+        summary[f_key] = {
+            "max": round(max(vals), 4) if vals else 0.0,
+            "min": round(min(vals), 4) if vals else 0.0,
+        }
+
+    for d_key in disp_aliases:
+        vals = list(components_extracted[d_key].values())
+        summary[d_key] = {
+            "max": round(max(vals), 6) if vals else 0.0,
+            "min": round(min(vals), 6) if vals else 0.0,
+        }
+
+    return {
+        "loadcase": target_lc,
+        "available_loadcases": available_lcs,
+        "elements": transverse_elements,
+        "nodes": transverse_nodes,
+        "end_diaphragm_elements": end_diaphragms,
+        "cross_bracing_elements": cross_bracings,
+        "element_connectivity": {e: members_parsed[e] for e in transverse_elements if e in members_parsed},
+        "forces": forces_extracted,
+        "displacements": displacements_extracted,
+        "components": components_extracted,
+        "summary": summary,
+    }
 
 
 def _dump(data: dict, filename: str = "bridge_plot_data.json") -> None:

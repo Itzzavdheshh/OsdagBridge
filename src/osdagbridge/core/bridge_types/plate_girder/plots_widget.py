@@ -1,6 +1,9 @@
 import numpy as np
 import plotly.graph_objects as go
-import openseespy.opensees as ops
+try:
+    import openseespy.opensees as ops
+except (ImportError, ModuleNotFoundError):
+    ops = None
 
 FORCE_MAP = {
     "Fx": ("Vx_i", "Vx_j"),
@@ -45,6 +48,8 @@ SHARED_SCENE = dict(
 
 def build_nodes_members():
     """Build nodes and members dicts from the active openseespy model."""
+    if ops is None:
+        return {}, {}
     nodes = {
         int(n): list(map(float, ops.nodeCoord(n)))
         for n in ops.getNodeTags()
@@ -111,12 +116,77 @@ def add_coordinate_triad(fig, nodes, scale=0.10):
 # ============================================================
 # SFD
 # ============================================================
-def build_figure_sfd(ds, force_key, nodes, members):
+def build_figure_sfd(ds, force_key, nodes, members, selected_member="All"):
     def find_component(name):
         for c in ds["Component"].values:
             if c.lower() == name.lower():
                 return c
         return None
+
+    if selected_member == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        t_data = extract_transverse_member_results(ds, nodes=nodes, members=members, component=force_key)
+        fig_sfd = go.Figure()
+        add_grillage_background(fig_sfd, nodes, members)
+        add_coordinate_triad(fig_sfd, nodes)
+
+        master_base_x, master_base_y, master_base_z = [], [], []
+        master_shear_x, master_shear_y, master_shear_z = [], [], []
+        master_hover_text = []
+
+        all_xs = [coord[0] for coord in nodes.values()]
+        x_range = (max(all_xs) - min(all_xs)) if all_xs else 1.0
+
+        trans_elems = t_data["elements"]
+        forces_t = t_data["forces"]
+        f_vals = []
+        for e in trans_elems:
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            f_vals.extend([vi, vj])
+
+        max_f = max(f_vals) if f_vals else 0.0
+        min_f = min(f_vals) if f_vals else 0.0
+        denom = (max_f - min_f) if (max_f - min_f) != 0 else (abs(max_f) or 1.0)
+        shear_scale = 0.25 * abs(x_range / denom)
+
+        for e in trans_elems:
+            n1, n2 = members[e]
+            x1, y1, z1 = nodes[n1]
+            x2, y2, z2 = nodes[n2]
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            y1_plot = vi * shear_scale
+            y2_plot = vj * shear_scale
+
+            master_base_x.extend([x1, x2, None])
+            master_base_y.extend([0, 0, None])
+            master_base_z.extend([z1, z2, None])
+
+            master_shear_x.extend([x1, x2, None])
+            master_shear_y.extend([y1_plot, y2_plot, None])
+            master_shear_z.extend([z1, z2, None])
+
+            master_hover_text.extend([
+                f"Element {e}<br>Node {n1}<br>{force_key} = {vi:.2f}",
+                f"Element {e}<br>Node {n2}<br>{force_key} = {vj:.2f}",
+                None
+            ])
+
+        fig_sfd.add_trace(go.Scatter3d(
+            x=master_base_x, y=master_base_y, z=master_base_z, mode="lines",
+            line=dict(color="green", width=3), hoverinfo="skip", showlegend=False
+        ))
+        fig_sfd.add_trace(go.Scatter3d(
+            x=master_shear_x, y=master_shear_y, z=master_shear_z, mode="lines",
+            line=dict(color="blue", width=6), hoverinfo="text", text=master_hover_text, showlegend=False
+        ))
+        fig_sfd.update_layout(
+            uirevision="constant_view",
+            hoverlabel=dict(bgcolor="#E6F2FF", font_size=12, font_color="#2C3E50", bordercolor="#BBD6EE", namelength=-1),
+            scene=SHARED_SCENE,
+            margin=dict(l=0, r=0, t=40, b=0),
+            paper_bgcolor="white", plot_bgcolor="white"
+        )
+        return fig_sfd.to_json()
 
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     comp_i = find_component(comp_i_name)
@@ -127,15 +197,22 @@ def build_figure_sfd(ds, force_key, nodes, members):
 
     Z_TOL = 3
     node_z = {}
-    for n in ops.getNodeTags():
-        z = float(ops.nodeCoord(n)[2])
-        node_z[int(n)] = round(z, Z_TOL)
+    if ops is not None:
+        for n in ops.getNodeTags():
+            z = float(ops.nodeCoord(n)[2])
+            node_z[int(n)] = round(z, Z_TOL)
+    else:
+        node_z = {int(n): round(coord[2], Z_TOL) for n, coord in nodes.items()}
 
     from collections import defaultdict
     girders = defaultdict(list)
 
-    for ele in ops.getEleTags():
-        n1, n2 = map(int, ops.eleNodes(ele))
+    ele_tags = ops.getEleTags() if ops is not None else list(members.keys())
+    for ele in ele_tags:
+        if ops is not None:
+            n1, n2 = map(int, ops.eleNodes(ele))
+        else:
+            n1, n2 = map(int, members[int(ele)])
         z1, z2 = node_z[n1], node_z[n2]
         if z1 == z2:
             girders[z1].append(int(ele))
@@ -243,12 +320,78 @@ def build_figure_sfd(ds, force_key, nodes, members):
 # ============================================================
 # BMD
 # ============================================================
-def build_figure_bmd(ds, force_key, nodes, members):
+def build_figure_bmd(ds, force_key, nodes, members, selected_member="All"):
     def find_component(name):
         for c in ds["Component"].values:
             if c.lower() == name.lower():
                 return c
         return None
+
+    if selected_member == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        t_data = extract_transverse_member_results(ds, nodes=nodes, members=members, component=force_key)
+        fig_bmd = go.Figure()
+        add_grillage_background(fig_bmd, nodes, members)
+        add_coordinate_triad(fig_bmd, nodes)
+
+        master_line_x, master_line_y, master_line_z = [], [], []
+        master_base_x, master_base_y, master_base_z = [], [], []
+        master_hover_text = []
+
+        all_xs = [coord[0] for coord in nodes.values()]
+        x_range = (max(all_xs) - min(all_xs)) if all_xs else 1.0
+
+        trans_elems = t_data["elements"]
+        forces_t = t_data["forces"]
+        m_vals = []
+        for e in trans_elems:
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            m_vals.extend([vi, vj])
+
+        max_m = max(m_vals) if m_vals else 0.0
+        min_m = min(m_vals) if m_vals else 0.0
+        denom = (max_m - min_m) if (max_m - min_m) != 0 else (abs(max_m) or 1.0)
+        moment_scale = 0.1 * abs(x_range / denom)
+
+        for e in trans_elems:
+            n1, n2 = members[e]
+            x1, y1, z1 = nodes[n1]
+            x2, y2, z2 = nodes[n2]
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            y1_plot = vi * moment_scale
+            y2_plot = vj * moment_scale
+
+            master_base_x.extend([x1, x2, None])
+            master_base_y.extend([0, 0, None])
+            master_base_z.extend([z1, z2, None])
+
+            master_line_x.extend([x1, x2, None])
+            master_line_y.extend([y1_plot, y2_plot, None])
+            master_line_z.extend([z1, z2, None])
+
+            master_hover_text.extend([
+                f"Element {e}<br>Node {n1}<br>{force_key} = {vi:.2f}",
+                f"Element {e}<br>Node {n2}<br>{force_key} = {vj:.2f}",
+                None
+            ])
+
+        summary_data = {"Transverse Members": {"max": max_m, "min": min_m}}
+
+        fig_bmd.add_trace(go.Scatter3d(
+            x=master_line_x, y=master_line_y, z=master_line_z, mode='lines',
+            line=dict(color="red", width=4), text=master_hover_text, hoverinfo="text", showlegend=False
+        ))
+        fig_bmd.add_trace(go.Scatter3d(
+            x=master_base_x, y=master_base_y, z=master_base_z, mode='lines',
+            line=dict(color="green", width=3, dash='solid'), showlegend=False, hoverinfo='skip'
+        ))
+        fig_bmd.update_layout(
+            uirevision="constant_view",
+            hoverlabel=dict(bgcolor="#FFE4E1", font_size=12, font_color="#2C3E50", bordercolor="#CBD5E1", namelength=-1),
+            scene=SHARED_SCENE,
+            paper_bgcolor="white", plot_bgcolor="white", margin=dict(l=0, r=0, t=40, b=0)
+        )
+        return fig_bmd.to_json(), summary_data
 
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     comp_i = find_component(comp_i_name)
@@ -259,15 +402,22 @@ def build_figure_bmd(ds, force_key, nodes, members):
 
     Z_TOL = 3
     node_z = {}
-    for n in ops.getNodeTags():
-        z = float(ops.nodeCoord(n)[2])
-        node_z[int(n)] = round(z, Z_TOL)
+    if ops is not None:
+        for n in ops.getNodeTags():
+            z = float(ops.nodeCoord(n)[2])
+            node_z[int(n)] = round(z, Z_TOL)
+    else:
+        node_z = {int(n): round(coord[2], Z_TOL) for n, coord in nodes.items()}
 
     from collections import defaultdict
     girders = defaultdict(list)
 
-    for ele in ops.getEleTags():
-        n1, n2 = map(int, ops.eleNodes(ele))
+    ele_tags = ops.getEleTags() if ops is not None else list(members.keys())
+    for ele in ele_tags:
+        if ops is not None:
+            n1, n2 = map(int, ops.eleNodes(ele))
+        else:
+            n1, n2 = map(int, members[int(ele)])
         z1, z2 = node_z[n1], node_z[n2]
         if z1 == z2:
             girders[z1].append(int(ele))

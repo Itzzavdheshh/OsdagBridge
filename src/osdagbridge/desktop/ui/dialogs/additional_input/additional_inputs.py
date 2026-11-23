@@ -3,11 +3,12 @@ Additional Inputs Widget for Highway Bridge Design
 Provides detailed input fields for manual bridge parameter definition
 """
 from copy import deepcopy
+import re
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTabBar, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QSizePolicy,
-    QDialog, QSizePolicy, QSizeGrip,
+    QDialog, QSizePolicy, QSizeGrip, QStackedWidget,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QEvent
 from PySide6.QtGui import QDoubleValidator
@@ -58,6 +59,10 @@ class AdditionalInputs(QDialog):
         # Store all Compute functions to be called at Design
         self._compute_functions = []
 
+        # Tracking unsaved changes and programmatic loading state (Task II)
+        self.is_modified: bool = False
+        self._loading: bool = False
+
         self.setObjectName("AdditionalInputs")
         self.setMinimumSize(900, 520)
         
@@ -85,8 +90,13 @@ class AdditionalInputs(QDialog):
         main_layout.setContentsMargins(1, 1, 1, 1)
         main_layout.setSpacing(0)
 
-        self.title_bar = CustomTitleBar()
+        self.title_bar = CustomTitleBar(parent=self)
         self.title_bar.setTitle("Additional Inputs")
+        try:
+            self.title_bar.btn_close.clicked.disconnect()
+        except Exception:
+            pass
+        self.title_bar.btn_close.clicked.connect(self.close)
         main_layout.addWidget(self.title_bar)
 
         self.content_widget = QWidget(self)
@@ -229,22 +239,29 @@ class AdditionalInputs(QDialog):
         return super().eventFilter(obj, event)
 
     def set_input_dictionary(self, input_dict: dict):  # lifecycle: sets default/working dicts and wires END_CONNECTORS on first open
-        self.default_input_dict = input_dict
-        self.working_input_dict = deepcopy(input_dict)
+        self._loading = True
+        try:
+            self.default_input_dict = deepcopy(input_dict)
+            self.working_input_dict = deepcopy(input_dict)
 
-        self.set_defaults()
+            self.set_defaults()
 
-        self.default_input_dict.update(self.working_input_dict)
+            self.default_input_dict.update(self.working_input_dict)
 
-        self._last_good_layout = {
-            KEY_TS_GIRDER_SPACING: self.working_input_dict.get(KEY_TS_GIRDER_SPACING),
-            KEY_TS_NO_OF_GIRDERS:  self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS),
-        }
+            self._last_good_layout = {
+                KEY_TS_GIRDER_SPACING: self.working_input_dict.get(KEY_TS_GIRDER_SPACING),
+                KEY_TS_NO_OF_GIRDERS:  self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS),
+            }
 
-        if self.interacted_first:
-            self.interacted_first = False
-            from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import END_CONNECTORS
-            UIBuilder.wire_end_connectors(END_CONNECTORS, ai=self)
+            if self.interacted_first:
+                self.interacted_first = False
+                from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import END_CONNECTORS
+                UIBuilder.wire_end_connectors(END_CONNECTORS, ai=self)
+
+            self.refresh_typical_section()
+        finally:
+            self._loading = False
+            self.is_modified = False
 
     def set_defaults(self) -> None:  # lifecycle: populates all widgets from working_input_dict; called at init time only
         """
@@ -497,6 +514,9 @@ class AdditionalInputs(QDialog):
 
             self.working_input_dict[name] = value
 
+        if not getattr(self, "_loading", False):
+            self.is_modified = True
+
     def showEvent(self, event):  # Qt event: refreshes active sub-tabs when dialog is shown or reopened
         super().showEvent(event)
         from PySide6.QtWidgets import QTabWidget
@@ -504,9 +524,202 @@ class AdditionalInputs(QDialog):
             if hasattr(tab_widget, "refresh_active_tab"):
                 tab_widget.refresh_active_tab()
 
-    # ── Dialog Persistence ───────────────────────────────────────────────────────
+    def closeEvent(self, event):
+        """Prompt user to discard or cancel if unsaved changes exist."""
+        if getattr(self, "is_modified", False):
+            msg_box = CustomMessageBox(
+                title="Unsaved Changes",
+                text="You have unsaved changes. Closing this window will discard them. Do you want to proceed?",
+                buttons=["Discard", "Cancel"],
+                dialogType=MessageBoxType.Warning,
+            )
+            res = msg_box.exec()
+            if res == "Discard":
+                self._loading = True
+                try:
+                    self.working_input_dict = deepcopy(self.default_input_dict)
+                    self.set_defaults()
+                finally:
+                    self._loading = False
+                    self.is_modified = False
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+    def reject(self):
+        """Ensure Escape key or dialog reject routes through closeEvent."""
+        self.close()
+
+    # ── Dialog Persistence & Validation ──────────────────────────────────────────
+
+    def _is_control_active(self, widget: QWidget) -> bool:
+        """Check if widget is enabled, not hidden, and within an active tab hierarchy."""
+        if widget is None or not widget.isEnabled() or widget.isHidden():
+            return False
+        curr = widget.parentWidget()
+        while curr is not None and curr is not self:
+            parent = curr.parentWidget()
+            if isinstance(parent, QStackedWidget) and isinstance(parent.parentWidget(), QTabWidget):
+                tab_widget = parent.parentWidget()
+                idx = tab_widget.indexOf(curr)
+                if idx != -1 and not tab_widget.isTabEnabled(idx):
+                    return False
+            elif isinstance(parent, QTabWidget):
+                idx = parent.indexOf(curr)
+                if idx != -1 and not parent.isTabEnabled(idx):
+                    return False
+            else:
+                if curr.isHidden() or not curr.isEnabled():
+                    return False
+            curr = parent
+        return True
+
+    def _get_field_label(self, field_id: str, default: str = "") -> str:
+        """Retrieve human-readable parameter name for error messages."""
+        lbl = self.findChild(QLabel, field_id + "_label")
+        if lbl and lbl.text().strip():
+            raw = lbl.text().strip()
+            clean = re.sub(r'<[^>]+>', '', raw).strip().rstrip(':')
+            if clean:
+                if clean in ("Type", "Width (m)", "Height (m)", "Area (m²)", "Load (kN/m)", "Material Density (kN/m³)", "Width", "Height", "Area", "Load", "Density"):
+                    if "crash_barrier" in field_id:
+                        return f"Crash Barrier {clean}"
+                    elif "median" in field_id:
+                        return f"Median {clean}"
+                    elif "railing" in field_id:
+                        return f"Railing {clean}"
+                    elif "wearing_course" in field_id:
+                        return f"Wearing Course {clean}"
+                return clean
+
+        if not hasattr(self, "_schema_label_cache"):
+            self._schema_label_cache = {}
+            def _extract(obj):
+                if isinstance(obj, dict):
+                    if "id" in obj and "label" in obj:
+                        c = re.sub(r'<[^>]+>', '', str(obj["label"])).strip().rstrip(':')
+                        if c:
+                            self._schema_label_cache[obj["id"]] = c
+                    for v in obj.values():
+                        _extract(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        _extract(it)
+            _extract(ADDITIONAL_INPUTS_SCHEMA)
+
+        if field_id in self._schema_label_cache:
+            clean = self._schema_label_cache[field_id]
+            if clean in ("Type", "Width (m)", "Height (m)", "Area (m²)", "Load (kN/m)", "Material Density (kN/m³)", "Width", "Height", "Area", "Load", "Density"):
+                if "crash_barrier" in field_id:
+                    return f"Crash Barrier {clean}"
+                elif "median" in field_id:
+                    return f"Median {clean}"
+                elif "railing" in field_id:
+                    return f"Railing {clean}"
+                elif "wearing_course" in field_id:
+                    return f"Wearing Course {clean}"
+            return clean
+
+        return default or field_id
+
+    def _validate_custom_inputs(self) -> tuple[bool, str | None]:
+        """Validate that all active custom inputs have non-empty, non-whitespace values.
+
+        Inspects all active tabs and controls where mode or dropdown is 'Custom'.
+        Returns (True, None) if all required custom fields are valid,
+        or (False, error_message) identifying the missing parameter.
+        """
+        # 1. Check all TYPE_MODE_LINE combos (objectName ending in '.mode')
+        for combo in self.findChildren(QComboBox):
+            name = combo.objectName()
+            if not name or not name.endswith(".mode"):
+                continue
+            if not self._is_control_active(combo):
+                continue
+            if combo.currentText().strip().lower() == "custom":
+                base_id = name[:-5]
+                val_widget = self.findChild(QLineEdit, base_id + ".value")
+                if val_widget:
+                    text = val_widget.text().strip()
+                    if not text:
+                        param_name = self._get_field_label(base_id)
+                        return False, f"Please enter a valid value for {param_name}."
+
+        # 2. Crash Barrier Custom Type
+        cb_combo = self.findChild(QComboBox, KEY_CB_TYPE)
+        if cb_combo and self._is_control_active(cb_combo) and cb_combo.currentText().strip() == "Custom":
+            for key in [KEY_CB_DENSITY, KEY_CB_WIDTH, KEY_CB_HEIGHT, KEY_CB_AREA, KEY_CB_LOAD]:
+                w = self.findChild(QLineEdit, key)
+                if w:
+                    if not w.text().strip():
+                        label = self._get_field_label(key, f"Crash Barrier {key}")
+                        return False, f"Please enter a valid value for {label}."
+
+        # 3. Median Custom Type (only if median tab is active)
+        md_combo = self.findChild(QComboBox, KEY_MD_TYPE)
+        if md_combo and self._is_control_active(md_combo) and md_combo.currentText().strip() == "Custom":
+            for key in [KEY_MD_DENSITY, KEY_MD_WIDTH, KEY_MD_HEIGHT, KEY_MD_AREA, KEY_MD_LOAD]:
+                w = self.findChild(QLineEdit, key)
+                if w:
+                    if not w.text().strip():
+                        label = self._get_field_label(key, f"Median {key}")
+                        return False, f"Please enter a valid value for {label}."
+
+        # 4. Railing Custom Type (only if railing tab is active)
+        rl_combo = self.findChild(QComboBox, KEY_RL_TYPE)
+        if rl_combo and self._is_control_active(rl_combo) and rl_combo.currentText().strip() == "Custom":
+            for key in [KEY_RL_WIDTH, KEY_RL_HEIGHT]:
+                w = self.findChild(QLineEdit, key)
+                if w:
+                    if not w.text().strip():
+                        label = self._get_field_label(key, f"Railing {key}")
+                        return False, f"Please enter a valid value for {label}."
+            mode_combo = self.findChild(QComboBox, KEY_RL_LOAD_MODE)
+            if mode_combo and self._is_control_active(mode_combo) and mode_combo.currentText().strip() != "As per IRC 6":
+                load_w = self.findChild(QLineEdit, KEY_RL_LOAD_VALUE)
+                if load_w:
+                    if not load_w.text().strip():
+                        label = self._get_field_label(KEY_RL_LOAD_VALUE, "Railing Load")
+                        return False, f"Please enter a valid value for {label}."
+
+        # 5. Wearing Course Custom Material
+        wc_combo = self.findChild(QComboBox, KEY_WC_MATERIAL)
+        if wc_combo and self._is_control_active(wc_combo) and wc_combo.currentText().strip() == "Custom":
+            w = self.findChild(QLineEdit, KEY_WC_DENSITY)
+            if w:
+                if not w.text().strip():
+                    label = self._get_field_label(KEY_WC_DENSITY, "Wearing Course Density")
+                    return False, f"Please enter a valid value for {label}."
+
+        # 6. Adaptive Widgets (e.g. KEY_DESIGN_MODE == "Custom")
+        for adaptive in self.findChildren(AdaptiveWidget):
+            if not self._is_control_active(adaptive):
+                continue
+            ctrl_id = getattr(adaptive, "_controller_id", "")
+            mode = str(self.working_input_dict.get(ctrl_id) or "")
+            if mode.strip().lower() in ("custom", "customized"):
+                active = adaptive.currentWidget()
+                if isinstance(active, QLineEdit):
+                    if not active.text().strip():
+                        field_id = getattr(adaptive, "_field_id", "")
+                        label = self._get_field_label(field_id)
+                        return False, f"Please enter a valid value for {label}."
+
+        return True, None
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+        # Validate custom inputs before saving
+        is_valid, err_msg = self._validate_custom_inputs()
+        if not is_valid:
+            CustomMessageBox(
+                title="Validation Error",
+                text=err_msg,
+                buttons=["OK"],
+                dialogType=MessageBoxType.Warning,
+            ).exec()
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -521,6 +734,9 @@ class AdditionalInputs(QDialog):
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
             self.update_template_page_2d_cad.emit(cad.params)
+
+        # Successful save resets modification state
+        self.is_modified = False
         
         CustomMessageBox(
             title="Saved",
@@ -546,6 +762,9 @@ class AdditionalInputs(QDialog):
         - QComboBox: always valid, skip validation, update dict + CAD.
         - QLineEdit: hard validation — corrects widget + input_dict if invalid, shows popup.
         """
+        if not getattr(self, "_loading", False):
+            self.is_modified = True
+
         if isinstance(widget, str):
             self._update_input_dict(key, widget)
             self._update_additional_input_cad()
@@ -584,6 +803,9 @@ class AdditionalInputs(QDialog):
         self._update_additional_input_cad()
 
     def _on_field_editing(self, current_text: str, key: str):  # on_change: soft validation while typing — updates dict/CAD only when valid, no popups
+        if not getattr(self, "_loading", False):
+            self.is_modified = True
+
         if not current_text.strip():
             self._update_input_dict(key, "")
             self._update_additional_input_cad()
@@ -598,6 +820,9 @@ class AdditionalInputs(QDialog):
         self._update_additional_input_cad()
 
     def _update_input_dict(self, key: str, value: str):  # utility: writes a value to working_input_dict, falling back to default if empty
+        if not getattr(self, "_loading", False):
+            self.is_modified = True
+
         if value is None or value == "":
             self.working_input_dict[key] = self.default_input_dict.get(key)
         else:

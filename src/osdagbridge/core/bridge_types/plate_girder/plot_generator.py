@@ -8,7 +8,10 @@ import matplotlib.colors as mcolors
 from matplotlib.ticker import FuncFormatter
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-import openseespy.opensees as ops
+try:
+    import openseespy.opensees as ops
+except (ImportError, ModuleNotFoundError):
+    ops = None
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from mpl_toolkits.mplot3d import proj3d
 from matplotlib.text import Annotation
@@ -26,6 +29,9 @@ FORCE_MAP = {
     "Mx": ("Mx_i", "Mx_j"),
     "My": ("My_i", "My_j"),
     "Mz": ("Mz_i", "Mz_j"),
+    "Vy": ("Vy_i", "Vy_j"),
+    "Vz": ("Vz_i", "Vz_j"),
+    "Tx": ("Mx_i", "Mx_j"),
 }
 
 # Human-readable labels shown in plot titles / axis labels.
@@ -36,6 +42,7 @@ FORCE_MAP = {
 FORCE_DISPLAY = {
     "Fx": "F$_x$", "Fy": "V$_y$", "Fz": "V$_z$",
     "Mx": "T$_x$", "My": "M$_y$", "Mz": "M$_z$",
+    "Vy": "V$_y$", "Vz": "V$_z$", "Tx": "T$_x$",
 }
 
 # Displacement component map  key → component name in ds["displacements"]
@@ -92,6 +99,8 @@ def _set_value_axis_tick_formatter(ax, eng_scale, value_sign: float = 1.0, use_a
 
 def build_nodes_members():
     """Build nodes and members dicts from the active openseespy model."""
+    if ops is None:
+        return {}, {}
     nodes = {
         int(n): list(map(float, ops.nodeCoord(n)))
         for n in ops.getNodeTags()
@@ -375,7 +384,7 @@ def _add_coordinate_triad(ax, nodes, scale=0.12, eng_scale: float = 1.0):
     ax.set_zlim(zlim)
     
 def _get_bg_nodes_members(nodes, members, edge_dist, selected_girder, girder_items):
-    if selected_girder == "All":
+    if selected_girder in ("All", "Transverse Members"):
         return nodes, members
     filtered_nodes = {}
     filtered_members = {}
@@ -402,7 +411,7 @@ def _add_supports(ax, nodes, members, edge_dist=0.0, selected_girder="All"):
         if not elems: continue
         
         girder_name = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
-        if selected_girder != "All" and girder_name != selected_girder:
+        if selected_girder not in ("All", "Transverse Members") and girder_name != selected_girder:
             continue
 
         # Skip placing supports on edge beams if an overhang exists!
@@ -547,31 +556,46 @@ def build_figure_grillage(nodes, members, edge_dist=0.0, selected_girder="All"):
     
     base_color = "#388E3C"
 
-    for i, (z_val, elems) in enumerate(girder_items):
-        if not elems: continue
-        is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
+    if selected_girder == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        trans_res = extract_transverse_member_results(nodes=nodes, members=members)
+        t_elems = set(trans_res["elements"])
+        for ele, (n1, n2) in members.items():
+            if ele in t_elems:
+                x1, y1, z1 = nodes[n1]
+                x2, y2, z2 = nodes[n2]
+                ax.plot([x1, x2], [z1, z2], [0, 0], color="#1565C0", linewidth=3.0, zorder=4)
+        if trans_res["elements"]:
+            mid_e = trans_res["elements"][len(trans_res["elements"]) // 2]
+            n_mid = members[mid_e][0]
+            ax.text(nodes[n_mid][0], nodes[n_mid][2], 0, "Transverse Members",
+                    color="black", fontsize=13, fontweight="bold", ha="center", va="bottom", zorder=6, gid="girder_labels")
+    else:
+        for i, (z_val, elems) in enumerate(girder_items):
+            if not elems: continue
+            is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
+            girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
 
-        if selected_girder != "All" and girder_name != selected_girder:
-            continue
+            if selected_girder != "All" and girder_name != selected_girder:
+                continue
 
-        n_first = members[elems[0]][0]
-        n_last  = members[elems[-1]][1]
+            n_first = members[elems[0]][0]
+            n_last  = members[elems[-1]][1]
 
-        x_start = nodes[n_first][0]
-        x_end   = nodes[n_last][0]
-        z_base  = nodes[n_first][2]
+            x_start = nodes[n_first][0]
+            x_end   = nodes[n_last][0]
+            z_base  = nodes[n_first][2]
 
-        # Draw the solid longitudinal line (Grey for edge, Green for inner)
-        ax.plot([x_start, x_end], [z_base, z_base], [0, 0],
-                color="slategrey" if is_edge_beam else base_color,
-                linewidth=1.5, zorder=3)
+            # Draw the solid longitudinal line (Grey for edge, Green for inner)
+            ax.plot([x_start, x_end], [z_base, z_base], [0, 0],
+                    color="slategrey" if is_edge_beam else base_color,
+                    linewidth=1.5, zorder=3)
 
-        # Add the Girder labels (G1, G2, etc.) to the inner beams
-        if not is_edge_beam:
-            ax.text(x_start - (x_range * 0.02), z_base, 0, f"{girder_name}",
-                    color="black", fontsize=13, fontweight="normal",
-                    ha="right", va="center", zorder=6, gid="girder_labels")
+            # Add the Girder labels (G1, G2, etc.) to the inner beams
+            if not is_edge_beam:
+                ax.text(x_start - (x_range * 0.02), z_base, 0, f"{girder_name}",
+                        color="black", fontsize=13, fontweight="normal",
+                        ha="right", va="center", zorder=6, gid="girder_labels")
 
     # Extract node IDs and coordinates properly for tracking
     node_ids = list(bg_nodes.keys())
@@ -705,6 +729,45 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     # and the 3D "grid" can expand/shrink with v_scale.
     global_vmin = 0.0
     global_vmax = 0.0
+
+    if selected_girder == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        trans_res = extract_transverse_member_results(ds, nodes=nodes, members=members, component=force_key)
+        t_elems = trans_res["elements"]
+        forces_t = trans_res["forces"]
+        vals_all = []
+        for e in t_elems:
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            vi_kn, vj_kn = vi / 1000.0, vj / 1000.0
+            vals_all.extend([vi_kn, vj_kn])
+            h1 = vi_kn * v_scale
+            h2 = vj_kn * v_scale
+            global_vmin = min(global_vmin, float(min(h1, h2)))
+            global_vmax = max(global_vmax, float(max(h1, h2)))
+
+            n1, n2 = members[e]
+            x1, y1, z1 = nodes[n1]
+            x2, y2, z2 = nodes[n2]
+
+            ax.plot([x1, x2], [z1, z2], [0, 0], color=base_color, linewidth=1.5, zorder=3)
+            ax.plot([x1, x2], [z1, z2], [h1, h2], color=shear_color, linewidth=2.5, zorder=4)
+            ax.plot([x1, x1], [z1, z1], [0, h1], color=shear_color, linewidth=1.0, alpha=0.5, zorder=2)
+            ax.plot([x2, x2], [z2, z2], [0, h2], color=shear_color, linewidth=1.0, alpha=0.5, zorder=2)
+
+            sc = ax.scatter([x1, x2], [z1, z2], [h1, h2], color=shear_color, s=20, zorder=5, depthshade=False)
+            _scatter_objs.append(sc)
+            _scatter_data[id(sc)] = ([n1, n2], [x1, x2], [vi_kn, vj_kn])
+
+        if vals_all:
+            summary_data["Transverse Members"] = {
+                "max": float(np.max(vals_all)),
+                "min": float(np.min(vals_all)),
+            }
+        if t_elems:
+            mid_e = t_elems[len(t_elems) // 2]
+            n_mid = members[mid_e][0]
+            ax.text(nodes[n_mid][0], nodes[n_mid][2], 0, "Transverse Members",
+                    color="black", fontsize=13, fontweight="bold", ha="center", va="bottom", zorder=6, gid="girder_labels")
 
     for i, (z_val, elems) in enumerate(girder_items):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
@@ -957,6 +1020,49 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     # Track global scaled z-range for baseline at 0 and cube resizing.
     global_vmin = 0.0
     global_vmax = 0.0
+
+    if selected_girder == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        trans_res = extract_transverse_member_results(ds, nodes=nodes, members=members, component=force_key)
+        t_elems = trans_res["elements"]
+        forces_t = trans_res["forces"]
+        vals_all = []
+        for e in t_elems:
+            vi, vj = forces_t[e].get(force_key, (0.0, 0.0))
+            vi_knm, vj_knm = vi / 1000.0, vj / 1000.0
+            vals_all.extend([vi_knm, vj_knm])
+            h1 = -vi_knm * v_scale
+            h2 = -vj_knm * v_scale
+            global_vmin = min(global_vmin, float(min(h1, h2)))
+            global_vmax = max(global_vmax, float(max(h1, h2)))
+
+            n1, n2 = members[e]
+            x1, y1, z1 = nodes[n1]
+            x2, y2, z2 = nodes[n2]
+
+            # baseline
+            ax.plot([x1, x2], [z1, z2], [0, 0], color=base_color, linewidth=1.5, zorder=3)
+            # moment diagram line
+            ax.plot([x1, x2], [z1, z2], [h1, h2], color=moment_color, linewidth=2.5, zorder=4)
+            # drop lines
+            ax.plot([x1, x1], [z1, z1], [0, h1], color=moment_color, linewidth=1.0, alpha=0.5, zorder=2)
+            ax.plot([x2, x2], [z2, z2], [0, h2], color=moment_color, linewidth=1.0, alpha=0.5, zorder=2)
+
+            sc = ax.scatter([x1, x2], [z1, z2], [h1, h2], color=moment_color, s=20, zorder=5, depthshade=False)
+            _scatter_objs.append(sc)
+            _scatter_data[id(sc)] = ([n1, n2], [x1, x2], [vi_knm, vj_knm])
+
+        if vals_all:
+            summary_data["Transverse Members"] = {
+                "max": float(np.max(vals_all)),
+                "min": float(np.min(vals_all)),
+            }
+        if t_elems:
+            mid_e = t_elems[len(t_elems) // 2]
+            n_mid = members[mid_e][0]
+            ax.text(nodes[n_mid][0], nodes[n_mid][2], 0, "Transverse Members",
+                    color="black", fontsize=13, fontweight="bold", ha="center", va="bottom", zorder=6, gid="girder_labels")
+
     for i, (z_val, elems) in enumerate(girder_items_bmd):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders_bmd - 1)
         girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
@@ -1374,6 +1480,44 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     # Track global scaled z-range for baseline at 0 and cube resizing.
     global_vmin = 0.0
     global_vmax = 0.0
+
+    if selected_girder == "Transverse Members":
+        from .results_data import extract_transverse_member_results
+        trans_res = extract_transverse_member_results(ds, nodes=nodes, members=members, component=disp_key)
+        t_elems = trans_res["elements"]
+        disps_t = trans_res["displacements"]
+        vals_all = []
+        for e in t_elems:
+            n1, n2 = members[e]
+            x1, y1, z1 = nodes[n1]
+            x2, y2, z2 = nodes[n2]
+            d1 = disps_t.get(n1, {}).get(disp_key, 0.0)
+            d2 = disps_t.get(n2, {}).get(disp_key, 0.0)
+            vals_all.extend([d1, d2])
+            h1 = d1 * v_scale
+            h2 = d2 * v_scale
+            global_vmin = min(global_vmin, float(min(h1, h2)))
+            global_vmax = max(global_vmax, float(max(h1, h2)))
+
+            # baseline
+            ax.plot([x1, x2], [z1, z2], [0, 0], color=base_color, linewidth=1.5, zorder=3)
+            # deflection line
+            ax.plot([x1, x2], [z1, z2], [h1, h2], color=defl_color, linewidth=2.5, zorder=4)
+
+            sc = ax.scatter([x1, x2], [z1, z2], [h1, h2], color="black", s=20, zorder=5, depthshade=False)
+            _scatter_objs.append(sc)
+            _scatter_data[id(sc)] = ([n1, n2], [x1, x2], [d1, d2])
+
+        if vals_all:
+            summary_data["Transverse Members"] = {
+                "max": float(np.max(vals_all)),
+                "min": float(np.min(vals_all)),
+            }
+        if t_elems:
+            mid_e = t_elems[len(t_elems) // 2]
+            n_mid = members[mid_e][0]
+            ax.text(nodes[n_mid][0], nodes[n_mid][2], 0, "Transverse Members",
+                    color="black", fontsize=13, fontweight="bold", ha="center", va="bottom", zorder=6, gid="girder_labels")
 
     for i, (z_val, elems) in enumerate(girder_items):
         is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)

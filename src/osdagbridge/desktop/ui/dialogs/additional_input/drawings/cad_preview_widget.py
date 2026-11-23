@@ -261,6 +261,7 @@ class CadPreviewWidget(QWidget):
         self._stack.addWidget(self._cad)
 
         self._cross = CrossSectionCADWidget(self._stack)
+        self._cross.enable_parameter_editing = False
         self._cross.show_dimensions = False
         self._cross.interactive_hover = False
         self._cross.show_zoom_controls = False

@@ -14,10 +14,16 @@ from osdagbridge.desktop.ui.docks.cad_dual_view import BridgeDualCADWidget
 from osdagbridge.desktop.ui.dialogs.additional_input.additional_inputs import AdditionalInputs
 from osdagbridge.desktop.ui.dialogs.custom_messagebox import CustomMessageBox, MessageBoxType
 from osdagbridge.desktop.ui.dialogs.loading_popup import LoadingDialogManager
-from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
+try:
+    from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
+except (ImportError, ModuleNotFoundError):
+    class CAD3DWindow(QWidget):
+        def clear_3d_cad(self):
+            pass
 
 from osdagbridge.core.bridge_types.plate_girder.ui_fields import FrontendData
 from osdagbridge.core.bridge_types.plate_girder.defaults import BASIC_INPUT_DICT, solve_extend_basic_input_dict
+from osdagbridge.core.bridge_types.plate_girder.validator import BridgeInputValidator
 from osdagbridge.core.utils.common import *
 from osdagbridge.core.utils.osi_validator import validate_osi_inputs
 from osdagbridge.core.utils.logger import bridge_logger
@@ -350,6 +356,7 @@ class CustomWindow(QWidget):
         self.cad_comp_widget.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding
         )
+        self.cad_comp_widget.parameter_edit_requested.connect(self.on_cad_parameter_edited)
         self.cad_log_splitter.addWidget(self.cad_comp_widget)
 
         # from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
@@ -901,6 +908,105 @@ class CustomWindow(QWidget):
 
         # Apply state to CAD UI & Update Cad-State
         self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
+    def on_cad_parameter_edited(self, key: str, value: object) -> bool:
+        """
+        Handle parameter edit from 2D CAD canvas.
+        Validates input using BridgeInputValidator, shows standard error dialog on failure,
+        updates basic/additional input dictionaries and InputDock/AdditionalInputs,
+        re-solves layout geometry, and refreshes CAD.
+        """
+        str_val = str(value).strip() if value is not None else ""
+        if not str_val:
+            CustomMessageBox(
+                title="Validation Error",
+                text="Value cannot be empty.",
+                dialogType=MessageBoxType.Warning
+            ).exec()
+            self.update_cad_from_inputs()
+            return False
+
+        # Validate with BridgeInputValidator
+        test_dict = dict(self.input_dict)
+        test_dict[key] = str_val
+
+        validator = BridgeInputValidator()
+        err = None
+        if key in (KEY_SPAN, KEY_CARRIAGEWAY_WIDTH, KEY_SKEW_ANGLE):
+            err = validator.validate_basic_inputs(key, test_dict)
+        else:
+            err = validator.validate_additional_inputs(key, test_dict)
+
+        if err is not None:
+            _corrected_val, err_msg = err
+            CustomMessageBox(
+                title="Validation Error",
+                text=err_msg,
+                dialogType=MessageBoxType.Warning
+            ).exec()
+            self.update_cad_from_inputs()
+            return False
+
+        try:
+            num_val = float(str_val)
+            if key == KEY_TS_DECK_THICKNESS:
+                num_val = float(round(num_val))
+        except (ValueError, TypeError):
+            CustomMessageBox(
+                title="Validation Error",
+                text="Value must be a valid number.",
+                dialogType=MessageBoxType.Warning
+            ).exec()
+            self.update_cad_from_inputs()
+            return False
+
+        # Update authoritative state
+        old_val = self.input_dict.get(key)
+        self.input_dict[key] = num_val
+
+        # Solve layout geometry
+        try:
+            if key == KEY_TS_GIRDER_SPACING:
+                solve_extend_basic_input_dict(self.input_dict, changed_field='spacing')
+            elif key in (KEY_CARRIAGEWAY_WIDTH, KEY_SPAN):
+                solve_extend_basic_input_dict(self.input_dict, changed_field='girders')
+            else:
+                solve_extend_basic_input_dict(self.input_dict)
+        except ValueError as e:
+            # Revert on layout failure (e.g. spacing too large for bridge width)
+            self.input_dict[key] = old_val
+            CustomMessageBox(
+                title="Validation Error",
+                text=str(e),
+                dialogType=MessageBoxType.Warning
+            ).exec()
+            self.update_cad_from_inputs()
+            return False
+        except Exception as e:
+            self.input_dict[key] = old_val
+            CustomMessageBox(
+                title="Validation Error",
+                text=f"Layout solver error: {e}",
+                dialogType=MessageBoxType.Warning
+            ).exec()
+            self.update_cad_from_inputs()
+            return False
+
+        # Synchronize InputDock
+        if hasattr(self, 'input_dock') and self.input_dock and hasattr(self.input_dock, 'input_widget') and self.input_dock.input_widget:
+            w = self.input_dock.input_widget.findChild(QWidget, key)
+            if w and isinstance(w, QLineEdit):
+                w.blockSignals(True)
+                w.setText(str(self.input_dict[key]))
+                w.blockSignals(False)
+
+        # Synchronize AdditionalInputs
+        if hasattr(self, '_additional_inputs_dialog') and self._additional_inputs_dialog is not None:
+            self._additional_inputs_dialog.set_input_dictionary(self.input_dict)
+
+        # Trigger CAD redraw
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+        return True
 
     #---------------------------------Docking-Icons-Functionality-START----------------------------------------------
 
